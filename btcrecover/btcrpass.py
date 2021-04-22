@@ -34,6 +34,7 @@ import sys, argparse, itertools, string, re, multiprocessing, signal, os, pickle
 import btcrecover.opencl_helpers
 
 # Import modules from requirements.txt
+from Crypto.Cipher import AES
 
 # Import optional modules
 module_opencl_available = False
@@ -2231,6 +2232,246 @@ class WalletBlockchainSecondpass(WalletBlockchain):
                     self.decrypt_wallet(password, iter_count)
 
                     return password.decode("utf_8", "replace"), count
+
+        return False, count
+
+
+############### Dogechain ###############
+
+@register_wallet_class
+class WalletDogechain(object):
+    opencl_algo = -1
+
+    _savepossiblematches = True
+    _possible_passwords_file = "possible_passwords.log"
+
+    _dump_privkeys_file = None
+    _dump_wallet_file = None
+    _using_extract = False
+
+    def data_extract_id():
+        return "dc"
+
+    #
+    # These are a bit fragile in the interest of simplicity because they assume that certain
+    # JSON data will be in the first block of the file
+    #
+    def decrypt(self, password):
+        passwordSHA256 = hashlib.sha256(password).digest()
+        passwordbase64 = base64.b64encode(passwordSHA256)
+        key = hashlib.pbkdf2_hmac('sha256', passwordbase64, self.salt, self._iter_count, 32)
+
+        decrypted = AES.new(key, AES.MODE_CBC).decrypt(self._encrypted_wallet)
+        padding = ord(decrypted[-1:])  # ISO 10126 padding length
+
+        # A bit fragile because it assumes the guid is in the first encrypted block,
+        return decrypted[:-padding] if 1 <= padding <= 16 and re.search(
+            b"\"guid\"|\"sharedKey\"|\"keys\"", decrypted) else None
+
+    def decrypt_wallet(self, password):
+        # Can't decrypt or dump an extract in any meaninful way...
+        if self._using_extract:
+            return
+
+        # If we aren't dumping these files, then just return...
+        if not (self._dump_wallet_file or self._dump_privkeys_file):
+            return
+
+        # print(self._encrypted_wallet)
+        data = self.decrypt(password)[16:]
+
+        # Load and parse the now-decrypted wallet
+        self._wallet_json = json.loads(data)
+
+        if self._dump_wallet_file:
+            self.dump_wallet()
+        if self._dump_privkeys_file:
+            self.dump_privkeys()
+
+    # This just dumps the wallet json as-is (regardless of whether the keys have been decrypted
+    def dump_wallet(self):
+        with open(self._dump_wallet_file, 'a') as logfile:
+            logfile.write(json.dumps(self._wallet_json, indent=4))
+
+    # This just dumps the wallet private keys
+    def dump_privkeys(self):
+        with open(self._dump_privkeys_file, 'a') as logfile:
+            logfile.write("Private Keys (For copy/paste) are below...\n")
+            for key in self._wallet_json['keys']:
+                try:
+                    logfile.write(key['priv'] + "\n")
+                except KeyError:
+                    print("Error: Private Key not correctly decrypted, likey due to second password being present...")
+
+    @staticmethod
+    def is_wallet_file(wallet_file):
+        wallet_file.seek(0)
+        try:
+            walletdata = wallet_file.read(7)[2:]
+        except: return False
+        return walletdata == b"email"  # Dogechain.info wallets have an email field at the start
+
+    def __init__(self, iter_count, loading=False):
+        assert loading, 'use load_from_* to create a ' + self.__class__.__name__
+        pbkdf2_library_name = load_pbkdf2_library().__name__
+        aes_library_name = load_aes256_library().__name__
+        self._iter_count = iter_count
+        self._passwords_per_second = 400000 if pbkdf2_library_name == "hashlib" else 100000
+        self._passwords_per_second /= iter_count
+        if aes_library_name != "Crypto" and self._passwords_per_second > 2000:
+            self._passwords_per_second = 2000
+
+    def __setstate__(self, state):
+        # (re-)load the required libraries after being unpickled
+        load_pbkdf2_library(warnings=False)
+        load_aes256_library(warnings=False)
+        self.__dict__ = state
+
+    def passwords_per_seconds(self, seconds):
+        return max(int(round(self._passwords_per_second * seconds)), 1)
+
+    # Load a Blockchain wallet file
+    @classmethod
+    def load_from_filename(cls, wallet_filename):
+        wallet_data = open(wallet_filename, "rb").read(64 * 2 ** 20)  # up to 64M, typical size is a few
+        wallet_json = json.loads(wallet_data)
+        self = cls(wallet_json["pbkdf2_iterations"], loading=True)
+        self.salt = base64.b64decode(wallet_json["salt"])
+        self._encrypted_wallet = base64.b64decode(wallet_json["payload"])
+        self._encrypted_block = base64.b64decode(wallet_json["payload"])[:32]
+        return self
+
+    def difficulty_info(self):
+        return "{:,} PBKDF2-SHA256 iterations".format(self._iter_count or 10)
+
+    def init_logfile(self):
+        with open(self._possible_passwords_file, 'a') as logfile:
+            logfile.write(
+                "\n\n" +
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " New Recovery Started...\n" +
+                "This file contains passwords and blocks from passwords which `may` not exactly match those that "
+                "BTCRecover searches for by default. \n\n"
+                "Examples of successfully decrypted blocks will not just be random characters, "
+                "some examples of what correctly decryped blocks logs look like are:\n\n"
+                "Possible Password ==>btcr-test-password<== in Decrypted Block ==>{\n\"guid\" : \"9bb<==\n"
+                "Possible Password ==>testblockchain<== in Decrypted Block ==>{\"address_book\":<==\n"
+                "Possible Password ==>btcr-test-password<== in Decrypted Block ==>{\"tx_notes\":{},\"\n"
+                "Possible Password ==>Testing123!<== in Decrypted Block ==>{\"double_encrypt<==\n"
+                "\n"
+                "Note: The markers ==> and <== are not part of either your password or the decrypted block...\n\n"
+                "If the password works and was not correctly found, or your wallet detects a false positive, please report the decrypted block data at "
+                "https://github.com/3rdIteration/btcrecover/issues/\n\n")
+        print("* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *")
+        print("*                     Note for dogechain.info Wallets...                *")
+        print("*                                                                       *")
+        print("*   Writing all `possibly matched` and fully matched Passwords &        *")
+        print("*   Decrypted blocks to ", self._possible_passwords_file)
+        print("*   This can be disabled with the --disablesavepossiblematches argument *")
+        print("* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *")
+        print()
+
+    # A bit fragile because it assumes that some specific text is in the first encrypted block,
+    def check_decrypted_block(self, unencrypted_block, password):
+        if unencrypted_block[0] == ord("{"):
+            if b'"' in unencrypted_block[
+                       :4]:  # If it really is a json wallet fragment, there will be a double quote in there within the first few characters...
+                try:
+                    # Try to decode the decrypted block to ascii, this will pretty much always fail on anything other
+                    # than the correct password
+                    unencrypted_block.decode("ascii")
+                    if self._savepossiblematches:
+                        with open(self._possible_passwords_file, 'a') as logfile:
+                            logfile.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") +
+                                          " Possible Password ==>" +
+                                          password.decode("utf_8") +
+                                          "<== in Decrypted Block ==>" +
+                                          unencrypted_block.decode("ascii") +
+                                          "<==\n")
+                except UnicodeDecodeError:
+                    pass
+
+            # Return True if
+            if re.search(b"\"guid\"|\"sharedKey\"|\"keys\"", unencrypted_block):
+                if self._savepossiblematches:
+                    try:
+                        with open('possible_passwords.log', 'a') as logfile:
+                            logfile.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") +
+                                          " Found Password ==>" +
+                                          password.decode("utf_8") +
+                                          "<== in Decrypted Block ==>" +
+                                          unencrypted_block.decode("ascii") +
+                                          "<==\n")
+                            return True  # Only return true if we can successfully decode the block in to ascii
+
+                    except UnicodeDecodeError:  # Likely a false positive if we can't...
+                        with open('possible_passwords.log', 'a') as logfile:
+                            logfile.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") +
+                                          " Found Likely False Positive Password (with non-Ascii characters in decrypted block) ==>" +
+                                          password.decode("utf_8") +
+                                          "<== in Decrypted Block ==>" +
+                                          unencrypted_block.decode("utf-8", "ignore") +
+                                          "<==\n")
+
+        return False
+
+    def return_verified_password_or_false(self, passwords):  # Blockchain.com Main Password
+        return self._return_verified_password_or_false_opencl(passwords) if (not isinstance(self.opencl_algo, int)) \
+            else self._return_verified_password_or_false_cpu(passwords)
+
+    # This is the time-consuming function executed by worker thread(s). It returns a tuple: if a password
+    # is correct return it, else return False for item 0; return a count of passwords checked for item 1
+    def _return_verified_password_or_false_cpu(self, arg_passwords):  # Blockchain.com Main Password
+        # Copy a few globals into local for a small speed boost
+        l_pbkdf2_hmac = pbkdf2_hmac
+        l_aes256_cbc_decrypt = aes256_cbc_decrypt
+        l_aes256_ofb_decrypt = aes256_ofb_decrypt
+        encrypted_block = self._encrypted_block
+        salt_and_iv = self.salt
+        iter_count = self._iter_count
+
+
+        # Convert Unicode strings (lazily) to UTF-8 bytestrings
+        passwords = map(lambda p: p.encode("utf_8", "ignore"), arg_passwords)
+
+        for count, password in enumerate(passwords, 1):
+            #if self.decrypt(password):
+            #    return password.decode("utf_8", "replace"), count
+
+            passwordSHA256 = hashlib.sha256(password).digest()
+            passwordbase64 = base64.b64encode(passwordSHA256)
+            key = hashlib.pbkdf2_hmac('sha256', passwordbase64, self.salt, self._iter_count, 32)
+
+            decrypted_block = AES.new(key, AES.MODE_CBC).decrypt(self._encrypted_block)[16:]
+
+            if self.check_decrypted_block(decrypted_block, password):
+                    # Decrypt and dump the wallet if required
+                    self.decrypt_wallet(password)
+                    return password.decode("utf_8", "replace"), count
+
+        return False, count
+
+    def _return_verified_password_or_false_opencl(self, arg_passwords):  # Blockchain.com Main Password
+        # Copy a few globals into local for a small speed boost
+        l_aes256_cbc_decrypt = aes256_cbc_decrypt
+        l_aes256_ofb_decrypt = aes256_ofb_decrypt
+        encrypted_block = self._encrypted_block
+        salt_and_iv = self._salt_and_iv
+        iter_count = self._iter_count
+
+        # Convert Unicode strings (lazily) to UTF-8 bytestrings
+        passwords = map(lambda p: base64.b64encode(hashlib.sha256(p.encode("utf_8", "ignore").digest())), arg_passwords)
+
+        clResult = self.opencl_algo.cl_pbkdf2(self.opencl_context_pbkdf2_sha256, passwords, salt_and_iv, iter_count, 32)
+
+        # This list is consumed, so recreated it and zip
+        passwords = map(lambda p: p.encode("utf_8", "ignore"), arg_passwords)
+
+        results = zip(passwords, clResult)
+
+        for count, (password, key) in enumerate(results, 1):
+            unencrypted_block = l_aes256_cbc_decrypt(key, salt_and_iv, encrypted_block)  # CBC mode
+            if self.check_blockchain_decrypted_block(unencrypted_block, password):
+                return password.decode("utf_8", "replace"), count
 
         return False, count
 
