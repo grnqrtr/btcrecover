@@ -1237,6 +1237,9 @@ class Test07WalletDecryption(unittest.TestCase):
     def test_blockchain_secondpass_unencrypted(self):  # this wallet has no second-password iter_count, so this case is also tested here
         self.wallet_tester("blockchain-unencrypted-wallet.aes.json", blockchain_mainpass="IGNORED")
 
+    def test_dogechain_info_cpu(self):
+        self.wallet_tester("dogechain.wallet.aes.json")
+
     def test_bitcoincore_pywallet(self):
         self.wallet_tester("bitcoincore-pywallet-dumpwallet.txt")
 

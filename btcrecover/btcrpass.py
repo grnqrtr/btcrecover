@@ -2307,9 +2307,10 @@ class WalletDogechain(object):
     def is_wallet_file(wallet_file):
         wallet_file.seek(0)
         try:
-            walletdata = wallet_file.read(7)[2:]
+            walletdata = wallet_file.read()
+            print(walletdata)
         except: return False
-        return walletdata == b"email"  # Dogechain.info wallets have an email field at the start
+        return (b"email" in walletdata and b"two_fa_method" in walletdata)  # Dogechain.info wallets have email and 2fa fields that are fairly unique
 
     def __init__(self, iter_count, loading=False):
         assert loading, 'use load_from_* to create a ' + self.__class__.__name__
